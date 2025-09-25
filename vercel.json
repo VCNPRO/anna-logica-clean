@@ -1,5 +1,5 @@
 {
   "env": {
-    "AWS_API_URL": "https://gckkwk7b92.execute-api.us-east-1.amazonaws.com/prod"
+    "AWS_API_URL": "https://vanobezo2c.execute-api.us-east-1.amazonaws.com/prod"
   }
 }
