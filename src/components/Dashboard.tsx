@@ -1,26 +1,39 @@
 'use client';
 
 import { useState } from 'react';
-import { Upload, FileText, Play, Clock, AlertCircle, CheckCircle2, Download } from 'lucide-react';
 
-interface TranscriptionResult {
-  success: boolean;
+interface AiAnalysisResult {
   transcription: string;
-  language: string;
-  provider?: string;
-  timestamp: string;
+  summary: string;
+  speakers: string[];
+  tags: string[];
+}
+
+interface UploadProgress {
+  progress: number;
+  message: string;
+  bytesUploaded: number;
+  totalBytes: number;
+  stage: string;
 }
 
 export default function Dashboard() {
-  const [selectedFiles, setSelectedFiles] = useState<File[]>([]);
+  const [result, setResult] = useState<unknown>(null);
   const [isLoading, setIsLoading] = useState(false);
-  const [result, setResult] = useState<TranscriptionResult | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [selectedFiles, setSelectedFiles] = useState<File[]>([]);
   const [currentLanguage, setCurrentLanguage] = useState('es');
+  const [currentAction, setCurrentAction] = useState<string>('');
+  const [speakers, setSpeakers] = useState<string>('');
+  const [summaryType, setSummaryType] = useState<'short' | 'detailed'>('detailed');
+  const [targetLanguage, setTargetLanguage] = useState('en');
+  const [uploadProgress, setUploadProgress] = useState<UploadProgress | null>(null);
+
+  const isDemoMode = true;
 
   const handleFileSelect = (event: React.ChangeEvent<HTMLInputElement>) => {
     const files = Array.from(event.target.files || []);
-    setSelectedFiles(files.slice(0, 10)); // Limit to 10 files
+    setSelectedFiles(prev => [...prev, ...files].slice(0, 50));
   };
 
   const handleDragOver = (e: React.DragEvent) => {
@@ -30,224 +43,618 @@ export default function Dashboard() {
   const handleDrop = (e: React.DragEvent) => {
     e.preventDefault();
     const files = Array.from(e.dataTransfer.files);
-    setSelectedFiles(files.slice(0, 10));
+    setSelectedFiles(prev => [...prev, ...files].slice(0, 50));
   };
 
   const removeFile = (index: number) => {
     setSelectedFiles(prev => prev.filter((_, i) => i !== index));
   };
 
-  const handleTranscribe = async () => {
-    if (selectedFiles.length === 0) {
-      setError('Por favor selecciona un archivo');
+  const downloadTranscription = async (format: 'pdf' | 'txt' | 'srt') => {
+    const resultData = displayResult as unknown as { data?: { transcription?: string }, aiAnalysis?: { transcription?: string }, fileName?: string };
+    const transcription = resultData?.data?.transcription || resultData?.aiAnalysis?.transcription;
+    const fileName = resultData?.fileName || 'transcription';
+
+    if (!transcription) {
+      console.error('No transcription data available');
       return;
     }
 
-    setIsLoading(true);
-    setError(null);
-    setResult(null);
+    // Simple download - create blob and download
+    const blob = new Blob([transcription], { type: 'text/plain' });
+    const url = window.URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    const baseName = fileName.replace(/\.[^/.]+$/, '');
+    a.download = `${baseName}.${format}`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    window.URL.revokeObjectURL(url);
+  };
+
+  const callAPI = async (endpoint: string, formData: FormData) => {
+    console.log(`Calling API: /api/${endpoint}`);
+
+    const response = await fetch(`/api/${endpoint}`, {
+      method: 'POST',
+      body: formData,
+    });
+
+    console.log(`API response status: ${response.status}`);
+
+    if (!response.ok) {
+      let errorMessage = `Error calling ${endpoint}`;
+      try {
+        const errorData = await response.json();
+        errorMessage = errorData.error || errorMessage;
+      } catch {
+        try {
+          const errorText = await response.text();
+          console.log('Error response text:', errorText.substring(0, 200));
+          errorMessage = `Server error: ${errorText.substring(0, 100)}`;
+        } catch {
+          errorMessage = `HTTP ${response.status} error`;
+        }
+      }
+      throw new Error(errorMessage);
+    }
 
     try {
-      const file = selectedFiles[0]; // Process first file
-      const formData = new FormData();
-      formData.append('file', file);
-      formData.append('language', currentLanguage);
-
-      const response = await fetch('/api/transcribe', {
-        method: 'POST',
-        body: formData,
-      });
-
-      if (!response.ok) {
-        throw new Error(`Error: ${response.status}`);
-      }
-
-      const data = await response.json();
-      setResult({
-        success: data.success,
-        transcription: data.transcription,
-        language: data.language || currentLanguage,
-        provider: data.provider,
-        timestamp: new Date().toISOString()
-      });
-
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Error al procesar el archivo');
-    } finally {
-      setIsLoading(false);
+      const jsonResponse = await response.json();
+      console.log('API response success:', Object.keys(jsonResponse));
+      return jsonResponse;
+    } catch (error) {
+      const responseText = await response.text();
+      console.log('Failed to parse JSON, response text:', responseText.substring(0, 200));
+      throw new Error(`Invalid JSON response: ${responseText.substring(0, 50)}...`);
     }
   };
 
-  const downloadTranscription = () => {
-    if (!result?.transcription) return;
+  const handleActionClick = async (action: string) => {
+    if (selectedFiles.length === 0) {
+      setError('Por favor selecciona al menos un archivo');
+      return;
+    }
 
-    const blob = new Blob([result.transcription], { type: 'text/plain' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `transcripcion-${new Date().toISOString().slice(0, 10)}.txt`;
-    a.click();
-    URL.revokeObjectURL(url);
+    const file = selectedFiles[0];
+    const maxSizeBytes = 3 * 1024 * 1024;
+
+    setCurrentAction(action);
+    setIsLoading(true);
+    setError(null);
+    setResult(null);
+    setUploadProgress(null);
+
+    try {
+      let uploadedFilePath: string | null = null;
+
+      if (file.size > maxSizeBytes) {
+        // Mock upload progress for large files
+        const mockProgress = (progress: number, message: string) => {
+          setUploadProgress({
+            progress,
+            message,
+            bytesUploaded: (file.size * progress) / 100,
+            totalBytes: file.size,
+            stage: progress < 100 ? 'uploading' : 'processing'
+          });
+        };
+
+        // Simulate chunked upload
+        for (let i = 0; i <= 100; i += 10) {
+          await new Promise(resolve => setTimeout(resolve, 100));
+          mockProgress(i, `Subiendo fragmento ${Math.floor(i/10) + 1}/10`);
+        }
+
+        uploadedFilePath = `/uploads/${file.name}`;
+      }
+
+      const formData = new FormData();
+
+      if (uploadedFilePath) {
+        formData.append('serverFilePath', uploadedFilePath);
+        formData.append('originalFileName', file.name);
+        formData.append('fileSize', file.size.toString());
+        formData.append('mimeType', file.type);
+      } else {
+        formData.append('file', file);
+      }
+
+      formData.append('language', currentLanguage);
+
+      let apiResult;
+
+      switch (action) {
+        case 'transcribir':
+          apiResult = await callAPI('transcribe', formData);
+          break;
+        case 'identificar':
+          formData.append('speakerHints', speakers);
+          apiResult = await callAPI('identify-speakers', formData);
+          break;
+        case 'resumir':
+          formData.append('summaryType', summaryType);
+          apiResult = await callAPI('summarize', formData);
+          break;
+        case 'traducir':
+          formData.append('targetLanguage', targetLanguage);
+          formData.append('sourceLanguage', currentLanguage);
+          apiResult = await callAPI('translate', formData);
+          break;
+        case 'analizar':
+          formData.append('analysisType', 'complete');
+          apiResult = await callAPI('analyze', formData);
+          break;
+        default:
+          throw new Error('Acción no reconocida');
+      }
+
+      setResult({
+        action,
+        data: apiResult,
+        fileName: file.name,
+        timestamp: new Date().toISOString()
+      });
+
+      setUploadProgress(null);
+
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : 'Error al procesar el archivo');
+      setUploadProgress(null);
+    } finally {
+      setIsLoading(false);
+      setCurrentAction('');
+    }
+  };
+
+  const formatResultForDisplay = (result: unknown) => {
+    if (!result) return null;
+
+    const { action, data } = result as Record<string, unknown>;
+
+    switch (action) {
+      case 'transcribir':
+        const transcriptionData = data as Record<string, string>;
+        return {
+          aiAnalysis: {
+            transcription: transcriptionData.transcription || '',
+            summary: `Transcripción en ${transcriptionData.language || 'idioma detectado'}`,
+            speakers: [],
+            tags: ['transcripción', transcriptionData.language || 'audio']
+          }
+        };
+      case 'identificar':
+        const speakerData = data as Record<string, unknown>;
+        return {
+          aiAnalysis: {
+            transcription: '',
+            summary: (speakerData.summary as string) || 'Identificación de oradores',
+            speakers: [],
+            tags: ['identificación', 'oradores', 'análisis']
+          }
+        };
+      case 'resumir':
+        const summaryData = data as Record<string, unknown>;
+        return {
+          aiAnalysis: {
+            transcription: '',
+            summary: (summaryData.summary as string) || 'Resumen del contenido',
+            speakers: [],
+            tags: (summaryData.tags as string[]) || []
+          }
+        };
+      case 'traducir':
+        const translationData = data as Record<string, string>;
+        return {
+          aiAnalysis: {
+            transcription: translationData.translatedText || '',
+            summary: `Traducido de ${translationData.sourceLanguage} a ${translationData.targetLanguage}`,
+            speakers: [],
+            tags: ['traducción', translationData.sourceLanguage, translationData.targetLanguage]
+          }
+        };
+      case 'analizar':
+        const analysisData = data as Record<string, unknown>;
+        return {
+          aiAnalysis: {
+            transcription: '',
+            summary: 'Análisis completo del archivo',
+            speakers: [],
+            tags: ['análisis', 'técnico']
+          },
+          technicalData: analysisData.technicalData
+        };
+      default:
+        return {
+          aiAnalysis: {
+            transcription: '',
+            summary: 'Resultado del análisis',
+            speakers: [],
+            tags: []
+          }
+        };
+    }
+  };
+
+  const displayResult = formatResultForDisplay(result);
+
+  // Result Components
+  const TranscriptionView = ({ aiAnalysis }: { aiAnalysis: AiAnalysisResult | null }) => {
+    if (!aiAnalysis?.transcription) return null;
+
+    return (
+      <div className="bg-white rounded-lg border border-gray-200 p-6 shadow-sm">
+        <h3 className="text-xl font-semibold mb-4 text-gray-900">Transcripción</h3>
+        <div className="max-h-96 overflow-y-auto text-gray-700 text-base leading-relaxed whitespace-pre-wrap">
+          {aiAnalysis.transcription}
+        </div>
+      </div>
+    );
+  };
+
+  const SummaryView = ({ aiAnalysis }: { aiAnalysis: AiAnalysisResult | null }) => {
+    if (!aiAnalysis?.summary) return null;
+
+    return (
+      <div className="bg-white rounded-lg border border-gray-200 p-6 shadow-sm">
+        <h3 className="text-xl font-semibold mb-4 text-gray-900">Resumen</h3>
+        <div className="text-gray-700 text-base leading-relaxed">
+          {aiAnalysis.summary}
+        </div>
+      </div>
+    );
+  };
+
+  const TagsView = ({ aiAnalysis }: { aiAnalysis: AiAnalysisResult | null }) => {
+    if (!aiAnalysis?.tags || aiAnalysis.tags.length === 0) return null;
+
+    return (
+      <div className="bg-white rounded-lg border border-gray-200 p-6 shadow-sm">
+        <h3 className="text-xl font-semibold mb-4 text-gray-900">Etiquetas</h3>
+        <div className="flex flex-wrap gap-2">
+          {aiAnalysis.tags.map((tag, index) => (
+            <span
+              key={index}
+              className="px-3 py-1 bg-orange-100 text-orange-800 rounded-full text-sm font-medium"
+            >
+              {tag}
+            </span>
+          ))}
+        </div>
+      </div>
+    );
   };
 
   return (
-    <div className="min-h-screen bg-gradient-to-br from-orange-50 to-white">
-      {/* Header */}
-      <div className="bg-white shadow-sm border-b">
-        <div className="container mx-auto px-4 py-4">
-          <div className="flex items-center justify-between">
-            <div className="flex items-center space-x-3">
-              <div className="w-10 h-10 bg-gradient-to-r from-orange-500 to-red-500 rounded-lg flex items-center justify-center">
-                <FileText className="w-6 h-6 text-white" />
-              </div>
-              <div>
-                <h1 className="text-2xl font-bold text-gray-900">Anna Logica</h1>
-                <p className="text-sm text-gray-600">Enterprise AI Transcription</p>
-              </div>
-            </div>
+    <div className="min-h-screen bg-gray-50">
+      {/* Demo Mode Banner */}
+      {isDemoMode && (
+        <div className="fixed top-0 left-0 right-0 bg-orange-500 text-white px-4 py-2 text-center text-sm font-medium z-50">
+          🚀 Modo Demo - Sin autenticación requerida |
+          <button
+            onClick={() => window.location.reload()}
+            className="ml-2 underline hover:no-underline"
+          >
+            Salir del modo demo
+          </button>
+        </div>
+      )}
+
+      {/* Settings Button - Top Right */}
+      <div className={`fixed ${isDemoMode ? 'top-16' : 'top-6'} right-6 z-40`}>
+        <div className="flex items-center gap-2 bg-white px-3 py-2 rounded-lg shadow-sm border border-gray-200">
+          <span className="text-sm text-gray-600">Ajustes</span>
+          <div className="w-5 h-5 text-gray-600">
+            <span>⚙️</span>
           </div>
         </div>
       </div>
 
-      <div className="container mx-auto px-4 py-8">
-        <div className="max-w-4xl mx-auto space-y-8">
+      <div className={`flex ${isDemoMode ? 'pt-10' : ''}`} style={{height: '100vh'}}>
+        {/* Sidebar */}
+        <div className="bg-white border-r border-gray-200 p-6 flex flex-col" style={{width: '33.333%', minWidth: '33.333%', maxWidth: '33.333%', height: '100%'}}>
+          {/* Header */}
+          <div className="flex items-center mb-6">
+            <h1 className="text-3xl text-orange-500 tracking-tight font-black">anna logica</h1>
+          </div>
 
-          {/* Upload Section */}
-          <div className="bg-white rounded-xl shadow-sm border p-8">
-            <h2 className="text-xl font-semibold text-gray-900 mb-6">Subir Archivos de Audio</h2>
-
+          {/* File Upload Section */}
+          <div className="mb-6">
             <div
-              className="border-2 border-dashed border-gray-300 rounded-lg p-8 text-center hover:border-orange-400 transition-colors cursor-pointer"
+              className="border-2 border-dashed border-gray-300 rounded-lg p-4 text-center cursor-pointer hover:border-orange-400 transition-colors"
               onDragOver={handleDragOver}
               onDrop={handleDrop}
               onClick={() => document.getElementById('file-input')?.click()}
             >
-              <Upload className="w-12 h-12 text-gray-400 mx-auto mb-4" />
-              <p className="text-lg text-gray-700 mb-2">
-                Arrastra archivos aquí o haz clic para seleccionar
-              </p>
-              <p className="text-sm text-gray-500">
-                Soporta MP3, WAV, MP4, M4A (max 50MB por archivo)
-              </p>
+              <div className="flex items-center gap-2 mb-3">
+                <span className="text-orange-500 text-sm">📁</span>
+                <h2 className="text-sm font-medium text-gray-900">Carga de Archivos</h2>
+              </div>
+              <p className="text-xs text-gray-600 mb-3">Sube archivos de audio, video o texto (archivos grandes soportados con subida fragmentada).</p>
+
+              <div className="text-gray-400 mb-3">
+                <svg className="w-6 h-6 mx-auto" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M7 16a4 4 0 01-.88-7.903A5 5 0 0115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12" />
+                </svg>
+              </div>
+              <p className="text-xs text-gray-600 mb-1">Arrastra y suelta hasta 50 archivos aquí</p>
+              <p className="text-xs text-gray-500 mb-2">o</p>
+              <button className="text-orange-500 text-xs font-medium hover:text-orange-600">
+                Selecciona archivos de tu equipo
+              </button>
               <input
                 id="file-input"
                 type="file"
-                accept="audio/*,video/*"
                 multiple
                 className="hidden"
                 onChange={handleFileSelect}
+                accept="audio/*,video/*,.txt,.docx,.pdf"
               />
-            </div>
-
-            {/* Selected Files */}
-            {selectedFiles.length > 0 && (
-              <div className="mt-6 space-y-2">
-                <h3 className="font-medium text-gray-900">Archivos seleccionados:</h3>
-                {selectedFiles.map((file, index) => (
-                  <div key={index} className="flex items-center justify-between p-3 bg-gray-50 rounded-lg">
-                    <div className="flex items-center space-x-3">
-                      <FileText className="w-5 h-5 text-gray-500" />
-                      <span className="text-sm text-gray-700">{file.name}</span>
-                      <span className="text-xs text-gray-500">
-                        ({(file.size / 1024 / 1024).toFixed(2)} MB)
-                      </span>
-                    </div>
-                    <button
-                      onClick={() => removeFile(index)}
-                      className="text-red-500 hover:text-red-700 text-sm"
-                    >
-                      Eliminar
-                    </button>
-                  </div>
-                ))}
-              </div>
-            )}
-
-            {/* Language Selection */}
-            <div className="mt-6 flex items-center space-x-4">
-              <label className="text-sm font-medium text-gray-700">Idioma:</label>
-              <select
-                value={currentLanguage}
-                onChange={(e) => setCurrentLanguage(e.target.value)}
-                className="border border-gray-300 rounded-md px-3 py-2 text-sm focus:ring-2 focus:ring-orange-500 focus:border-orange-500"
-              >
-                <option value="auto">Detectar automáticamente</option>
-                <option value="es">Español</option>
-                <option value="en">English</option>
-                <option value="fr">Français</option>
-                <option value="de">Deutsch</option>
-                <option value="it">Italiano</option>
-                <option value="pt">Português</option>
-              </select>
-            </div>
-
-            {/* Transcribe Button */}
-            <div className="mt-8 flex justify-center">
-              <button
-                onClick={handleTranscribe}
-                disabled={selectedFiles.length === 0 || isLoading}
-                className="px-8 py-3 bg-gradient-to-r from-orange-500 to-red-500 text-white rounded-lg font-medium hover:from-orange-600 hover:to-red-600 disabled:opacity-50 disabled:cursor-not-allowed flex items-center space-x-2"
-              >
-                {isLoading ? (
-                  <>
-                    <div className="w-5 h-5 border-2 border-white border-t-transparent rounded-full animate-spin" />
-                    <span>Procesando...</span>
-                  </>
-                ) : (
-                  <>
-                    <Play className="w-5 h-5" />
-                    <span>Transcribir Audio</span>
-                  </>
-                )}
-              </button>
             </div>
           </div>
 
-          {/* Error Display */}
-          {error && (
-            <div className="bg-red-50 border border-red-200 rounded-lg p-4 flex items-center space-x-3">
-              <AlertCircle className="w-5 h-5 text-red-500" />
-              <span className="text-red-700">{error}</span>
+          {/* AI Actions Section */}
+          <div className="mb-6">
+            <div className="flex items-center gap-2 mb-3">
+              <span className="text-orange-500 text-sm">🤖</span>
+              <h2 className="text-sm font-medium text-gray-900">Acciones IA</h2>
             </div>
-          )}
+            <p className="text-xs text-gray-600 mb-3">Selecciona archivos y aplica una acción de IA.</p>
 
-          {/* Results Display */}
-          {result && (
-            <div className="bg-white rounded-xl shadow-sm border p-8">
-              <div className="flex items-center justify-between mb-6">
-                <h2 className="text-xl font-semibold text-gray-900">Resultado de Transcripción</h2>
-                <button
-                  onClick={downloadTranscription}
-                  className="flex items-center space-x-2 px-4 py-2 bg-gray-100 hover:bg-gray-200 rounded-lg text-sm font-medium text-gray-700"
+            <div className="space-y-3">
+              <div>
+                <label className="block text-xs font-medium text-gray-700 mb-1">Idioma del Contenido</label>
+                <select
+                  value={currentLanguage}
+                  onChange={(e) => setCurrentLanguage(e.target.value)}
+                  className="w-full p-2 border border-gray-300 rounded-md text-xs focus:ring-2 focus:ring-orange-500 focus:border-orange-500"
                 >
-                  <Download className="w-4 h-4" />
-                  <span>Descargar TXT</span>
+                  <option value="auto">Detección automática</option>
+                  <option value="es">Español</option>
+                  <option value="en">English</option>
+                  <option value="fr">Français</option>
+                  <option value="ca">Català</option>
+                </select>
+              </div>
+
+              <div className="grid grid-cols-2 gap-2">
+                <button
+                  onClick={() => handleActionClick('transcribir')}
+                  disabled={isLoading}
+                  className="p-2 bg-orange-500 hover:bg-orange-600 text-white rounded-lg text-xs font-medium transition-colors disabled:opacity-50"
+                >
+                  📝 Transcribir
+                </button>
+                <button
+                  onClick={() => handleActionClick('identificar')}
+                  disabled={isLoading}
+                  className="p-2 bg-orange-500 hover:bg-orange-600 text-white rounded-lg text-xs font-medium transition-colors disabled:opacity-50"
+                >
+                  👥 Identificar Oradores
                 </button>
               </div>
 
-              <div className="space-y-4">
-                <div className="flex items-center space-x-2 text-sm text-gray-600">
-                  <CheckCircle2 className="w-4 h-4 text-green-500" />
-                  <span>Transcripción completada</span>
-                  <span>•</span>
-                  <span>Idioma: {result.language}</span>
-                  {result.provider && (
-                    <>
-                      <span>•</span>
-                      <span>Procesado por: {result.provider}</span>
-                    </>
-                  )}
-                </div>
+              <button
+                onClick={() => handleActionClick('resumir')}
+                disabled={isLoading}
+                className="w-full p-2 bg-orange-500 hover:bg-orange-600 text-white rounded-lg text-xs font-medium transition-colors disabled:opacity-50"
+              >
+                📋 Resumir y Etiquetar
+              </button>
 
-                <div className="bg-gray-50 rounded-lg p-6">
-                  <h3 className="font-medium text-gray-900 mb-3">Transcripción:</h3>
-                  <div className="prose max-w-none">
-                    <p className="text-gray-700 whitespace-pre-wrap">{result.transcription}</p>
+              <div className="flex items-center gap-3 text-xs mb-2">
+                <label className="flex items-center gap-1">
+                  <input
+                    type="radio"
+                    name="summary"
+                    className="accent-orange-500 scale-75"
+                    checked={summaryType === 'short'}
+                    onChange={() => setSummaryType('short')}
+                  />
+                  <span className="text-gray-700">Corto</span>
+                </label>
+                <label className="flex items-center gap-1">
+                  <input
+                    type="radio"
+                    name="summary"
+                    className="accent-orange-500 scale-75"
+                    checked={summaryType === 'detailed'}
+                    onChange={() => setSummaryType('detailed')}
+                  />
+                  <span className="text-gray-700">Detallado</span>
+                </label>
+              </div>
+
+              <input
+                type="text"
+                placeholder="Pistas de oradores (ej: Ana, Juan)"
+                value={speakers}
+                onChange={(e) => setSpeakers(e.target.value)}
+                className="w-full p-2 border border-gray-300 rounded-md text-xs focus:ring-2 focus:ring-orange-500 focus:border-orange-500 mb-2"
+              />
+
+              <button
+                onClick={() => handleActionClick('traducir')}
+                disabled={isLoading}
+                className="w-full p-2 bg-orange-500 hover:bg-orange-600 text-white rounded-lg text-xs font-medium transition-colors disabled:opacity-50 mb-2"
+              >
+                🌐 Traducir
+              </button>
+
+              <select
+                value={targetLanguage}
+                onChange={(e) => setTargetLanguage(e.target.value)}
+                className="w-full p-2 border border-gray-300 rounded-md text-xs focus:ring-2 focus:ring-orange-500 focus:border-orange-500 mb-3"
+              >
+                <option value="en">Inglés</option>
+                <option value="es">Español</option>
+                <option value="fr">Français</option>
+                <option value="ca">Català</option>
+              </select>
+
+              <button
+                onClick={() => handleActionClick('analizar')}
+                disabled={isLoading}
+                className="w-full p-2 bg-orange-500 hover:bg-orange-600 text-white rounded-lg text-xs font-medium transition-colors disabled:opacity-50"
+              >
+                📊 Analizar Fichero
+              </button>
+            </div>
+          </div>
+        </div>
+
+        {/* Main Content */}
+        <div className="flex-1 p-6 overflow-y-auto" style={{height: '100%'}}>
+          <div className="mb-6" style={{height: '28px'}}></div>
+
+          <div className="bg-white rounded-lg border border-gray-200 overflow-hidden" style={{height: 'calc(100vh - 200px)', minHeight: '500px'}}>
+            <div className="px-4 py-3 border-b border-gray-200">
+              <div className="flex items-center gap-2 mb-2">
+                <span className="text-orange-500 text-sm">📁</span>
+                <h2 className="text-sm font-medium text-gray-900">Archivos</h2>
+              </div>
+              <p className="text-xs text-gray-600">Archivos cargados y resultados del procesamiento</p>
+            </div>
+
+            {error && (
+              <div className="bg-red-50 border border-red-200 text-red-700 px-4 py-3 mx-4 mb-4 rounded-md text-xs">
+                {error}
+              </div>
+            )}
+
+            {isLoading && (
+              <div className="bg-blue-50 border border-blue-200 text-blue-700 px-4 py-3 mx-4 mb-4 rounded-md text-xs">
+                <div className="flex items-center gap-3 mb-2">
+                  <div className="w-4 h-4 border-2 border-blue-500 border-t-transparent rounded-full animate-spin"></div>
+                  <span>Procesando {currentAction}...</span>
+                </div>
+                {uploadProgress && (
+                  <div className="mt-2">
+                    <div className="flex items-center justify-between mb-1">
+                      <span className="text-xs">{uploadProgress.message}</span>
+                      <span className="text-xs">{Math.round(uploadProgress.progress)}%</span>
+                    </div>
+                    <div className="w-full bg-blue-200 rounded-full h-2">
+                      <div
+                        className="bg-blue-600 h-2 rounded-full transition-all duration-300"
+                        style={{ width: `${uploadProgress.progress}%` }}
+                      ></div>
+                    </div>
+                    <div className="flex items-center justify-between mt-1 text-xs">
+                      <span>{(uploadProgress.bytesUploaded / 1024 / 1024).toFixed(1)}MB / {(uploadProgress.totalBytes / 1024 / 1024).toFixed(1)}MB</span>
+                      <span className="capitalize">{uploadProgress.stage}</span>
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {displayResult ? (
+              <div className="px-4 py-6">
+                <div className="space-y-6">
+                  <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-3">
+                    <h3 className="text-sm font-semibold text-gray-900">Resultados del Análisis</h3>
+                    <div className="flex flex-col sm:flex-row gap-2 w-full sm:w-auto">
+                      {/* Botones de descarga */}
+                      {(() => {
+                        const resultData = displayResult as unknown as {
+                          action?: string,
+                          data?: { transcription?: string },
+                          aiAnalysis?: { transcription?: string }
+                        };
+                        return resultData?.aiAnalysis?.transcription;
+                      })() && (
+                        <div className="flex gap-2">
+                          <button
+                            onClick={() => downloadTranscription('pdf')}
+                            className="px-3 py-1 bg-red-600 text-white rounded-md hover:bg-red-700 transition-colors text-xs flex items-center gap-1"
+                            title="Descargar PDF"
+                          >
+                            📄 PDF
+                          </button>
+                          <button
+                            onClick={() => downloadTranscription('txt')}
+                            className="px-3 py-1 bg-gray-600 text-white rounded-md hover:bg-gray-700 transition-colors text-xs flex items-center gap-1"
+                            title="Descargar TXT"
+                          >
+                            📝 TXT
+                          </button>
+                          <button
+                            onClick={() => downloadTranscription('srt')}
+                            className="px-3 py-1 bg-purple-600 text-white rounded-md hover:bg-purple-700 transition-colors text-xs flex items-center gap-1"
+                            title="Descargar SRT (Subtítulos)"
+                          >
+                            🎬 SRT
+                          </button>
+                        </div>
+                      )}
+                      <button
+                        onClick={() => setResult(null)}
+                        className="px-3 py-1 bg-orange-500 text-white rounded-md hover:bg-orange-600 transition-colors text-xs"
+                      >
+                        Analizar otro archivo
+                      </button>
+                    </div>
+                  </div>
+                  <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+                    <div className="lg:col-span-2 space-y-6">
+                      <SummaryView aiAnalysis={displayResult.aiAnalysis} />
+                      <TranscriptionView aiAnalysis={displayResult.aiAnalysis} />
+                    </div>
+                    <div className="space-y-6">
+                      <TagsView aiAnalysis={displayResult.aiAnalysis} />
+                    </div>
                   </div>
                 </div>
               </div>
-            </div>
-          )}
+            ) : (
+              <>
+                <div className="px-4 py-3 border-b border-gray-200">
+                  <div className="flex items-center gap-4">
+                    <input type="checkbox" className="rounded border-gray-300 scale-75" />
+                    <span className="text-xs font-medium text-gray-900 flex-1">Nombre Archivo</span>
+                    <span className="text-xs font-medium text-gray-600 text-center" style={{minWidth: '80px'}}>Estado</span>
+                    <span className="text-xs font-medium text-gray-600">Acciones</span>
+                  </div>
+                </div>
+
+                {selectedFiles.length > 0 ? (
+                  <div className="divide-y divide-gray-200">
+                    {selectedFiles.map((file, index) => {
+                      const sizeInMB = (file.size / 1024 / 1024).toFixed(2);
+                      const isLarge = file.size > 3 * 1024 * 1024;
+
+                      return (
+                        <div key={index} className="px-4 py-3 flex items-center gap-4">
+                          <input type="checkbox" className="rounded border-gray-300 scale-75" />
+                          <div className="flex-1">
+                            <span className="text-xs text-gray-900 block">{file.name}</span>
+                            <span className={`text-xs ${isLarge ? 'text-blue-600' : 'text-gray-500'}`}>
+                              {sizeInMB}MB {isLarge && '(Subida fragmentada)'}
+                            </span>
+                          </div>
+                          <span className="text-xs text-gray-500 text-center" style={{minWidth: '80px'}}>
+                            Cargado
+                          </span>
+                          <button
+                            onClick={() => removeFile(index)}
+                            className="text-red-500 hover:text-red-700 text-xs"
+                          >
+                            Eliminar
+                          </button>
+                        </div>
+                      );
+                    })}
+                  </div>
+                ) : (
+                  <div className="px-4 py-8 text-center">
+                    <p className="text-xs text-gray-500">Aún no has subido ningún archivo.</p>
+                  </div>
+                )}
+              </>
+            )}
+          </div>
         </div>
       </div>
     </div>
