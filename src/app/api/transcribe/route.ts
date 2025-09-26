@@ -8,14 +8,34 @@ export async function POST(request: Request) {
     const file = formData.get('file') as File | null;
     const language = formData.get('language') as string || 'auto';
 
-    // Determine file path
-    const filePath = file?.name ? `/uploaded/${file.name}` : '/demo/test-audio.mp3';
+    let requestPayload = { language };
 
-    // Call AWS Lambda directly
+    // If we have a real file, convert to base64 for real transcription
+    if (file && file.size > 0) {
+      const arrayBuffer = await file.arrayBuffer();
+      const base64Content = Buffer.from(arrayBuffer).toString('base64');
+
+      requestPayload = {
+        language,
+        fileName: file.name,
+        fileContent: base64Content,
+        filePath: `/uploaded/${file.name}`
+      };
+
+      console.log(`📁 Processing real file: ${file.name}, size: ${file.size} bytes`);
+    } else {
+      // No file, use demo mode
+      requestPayload = {
+        language,
+        filePath: '/demo/test-audio.mp3'
+      };
+    }
+
+    // Call AWS Lambda with file content or demo mode
     const response = await fetch(`${AWS_API_URL}/transcribe`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ filePath, language })
+      body: JSON.stringify(requestPayload)
     });
 
     if (!response.ok) {
